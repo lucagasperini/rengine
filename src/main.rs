@@ -1,9 +1,11 @@
 use bytemuck::{Pod, Zeroable};
+use std::f32::consts::SQRT_2;
 use std::sync::Arc;
 use vulkano::buffer::TypedBufferAccess;
 use vulkano::command_buffer::{PrimaryAutoCommandBuffer, RenderPassBeginInfo, SubpassContents};
 use vulkano::device::Queue;
 use vulkano::image::swapchain;
+use vulkano::pipeline::compute;
 use vulkano::pipeline::graphics::input_assembly::PrimitiveTopology;
 use vulkano::pipeline::graphics::rasterization::{PolygonMode, RasterizationState};
 use vulkano::pipeline::graphics::GraphicsPipelineBuilder;
@@ -50,14 +52,106 @@ use winit::{
 struct GameStatus {
     pub viewport: Viewport,
     pub sensitivity: f32,
+    pub scene: RenderScene,
+}
+
+struct RenderObject {
+    id: String,
+    pipeline: Arc<GraphicsPipeline>,
+    vertex: Vec<VulkanVertex2D>,
+}
+
+impl RenderObject {
+    pub fn new(id: String, pipeline: Arc<GraphicsPipeline>, vertex: Vec<VulkanVertex2D>) -> Self {
+        let (c_x, c_y) = Self::compute_center(&vertex);
+        return Self {
+            id: id,
+            pipeline: pipeline,
+            vertex: vertex,
+        };
+    }
+
+    fn compute_center(vertex: &Vec<VulkanVertex2D>) -> (f32, f32) {
+        let mut proj_sum_x = 0.0;
+        let mut proj_sum_y = 0.0;
+        let num_vertex: f32 = vertex.len() as f32;
+        if (num_vertex == 0.0) {
+            return (0.0, 0.0);
+        }
+
+        for v in vertex {
+            proj_sum_x += v.position[0];
+            proj_sum_y += v.position[1];
+        }
+
+        return (proj_sum_x / num_vertex, proj_sum_y / num_vertex);
+    }
+
+    pub fn move_absolute(&mut self, x: f32, y: f32) {
+        let delta_x = x - self.vertex[0].position[0];
+        let delta_y = y - self.vertex[0].position[1];
+        self.move_relative(delta_x, delta_y);
+    }
+    pub fn move_relative(&mut self, delta_x: f32, delta_y: f32) {
+        for v in &mut self.vertex {
+            v.position[0] = v.position[0] + delta_x;
+            v.position[1] = v.position[1] + delta_y;
+        }
+        println!(
+            "Moving object id: {} at: (x={},y={})",
+            self.id, self.vertex[0].position[0], self.vertex[0].position[1]
+        );
+    }
+    pub fn move_right(&mut self, delta: f32) {
+        self.move_relative(delta, 0.0);
+    }
+    pub fn move_left(&mut self, delta: f32) {
+        self.move_relative(-delta, 0.0);
+    }
+    pub fn move_down(&mut self, delta: f32) {
+        self.move_relative(0.0, delta);
+    }
+    pub fn move_up(&mut self, delta: f32) {
+        self.move_relative(0.0, -delta);
+    }
+    pub fn rotate_point(&mut self, c_x: f32, c_y: f32, alpha: f32) {
+        for v in &mut self.vertex {
+            // taking relative center
+            let delta_x = v.position[0] - c_x;
+            let delta_y = v.position[1] - c_y;
+            // rotating vertex
+            v.position[0] = delta_x * alpha.cos() - delta_y * alpha.sin();
+            v.position[1] = delta_x * alpha.sin() + delta_y * alpha.cos();
+            // moving to center
+            v.position[0] = v.position[0] + c_x;
+            v.position[1] = v.position[1] + c_y;
+        }
+    }
+
+    pub fn rotate_center(&mut self, alpha: f32) {
+        let (c_x, c_y) = Self::compute_center(&self.vertex);
+        self.rotate_point(c_x, c_y, alpha);
+    }
+
+    pub fn scaling(&mut self, x: f32) {
+        assert!(x > 0.0);
+        for v in &mut self.vertex {
+            v.position[0] = v.position[0] * x;
+            v.position[1] = v.position[1] * x;
+        }
+    }
+}
+
+struct RenderScene {
+    pub objs: Vec<RenderObject>,
 }
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Zeroable, Pod)]
-struct Vertex {
+struct VulkanVertex2D {
     position: [f32; 2],
 }
-impl_vertex!(Vertex, position);
+impl_vertex!(VulkanVertex2D, position);
 
 mod tcs {
     vulkano_shaders::shader! {
@@ -262,7 +356,7 @@ fn create_pipeline(device: &Arc<Device>, render_pass: &Arc<RenderPass>) -> Arc<G
 
     return GraphicsPipeline::start()
         // We need to indicate the layout of the vertices.
-        .vertex_input_state(BuffersDefinition::new().vertex::<Vertex>())
+        .vertex_input_state(BuffersDefinition::new().vertex::<VulkanVertex2D>())
         .tessellation_shaders(
             tcs.entry_point("main").unwrap(),
             (),
@@ -320,39 +414,6 @@ fn recreate_swapchain(
     return (new_swapchain, new_images);
 }
 
-fn draw(
-    device: &Arc<Device>,
-    viewport: &Viewport,
-    pipeline: &Arc<GraphicsPipeline>,
-    queue: &Arc<Queue>,
-    frame: &Arc<Framebuffer>,
-    vertex_buffer: &Arc<CpuAccessibleBuffer<[Vertex]>>,
-) -> PrimaryAutoCommandBuffer {
-    let mut builder = AutoCommandBufferBuilder::primary(
-        device.clone(),
-        queue.family(),
-        CommandBufferUsage::OneTimeSubmit,
-    )
-    .unwrap();
-    builder
-        .begin_render_pass(
-            RenderPassBeginInfo {
-                clear_values: vec![Some([0.0, 0.0, 0.0, 1.0].into())],
-                ..RenderPassBeginInfo::framebuffer(frame.clone())
-            },
-            SubpassContents::Inline,
-        )
-        .unwrap()
-        .set_viewport(0, [viewport.clone()])
-        .bind_pipeline_graphics(pipeline.clone())
-        .bind_vertex_buffers(0, vertex_buffer.clone())
-        .draw(vertex_buffer.len() as u32, 1, 0, 0)
-        .unwrap()
-        .end_render_pass()
-        .unwrap();
-    return builder.build().unwrap();
-}
-
 fn window_size_dependent_setup(
     images: &[Arc<SwapchainImage<Window>>],
     render_pass: Arc<RenderPass>,
@@ -383,30 +444,19 @@ fn keypressed(input: &KeyboardInput, gs: &mut GameStatus) {
     }
 
     match input.virtual_keycode {
-        Some(VirtualKeyCode::Up) => {
-            gs.viewport.origin = [
-                gs.viewport.origin[0],
-                gs.viewport.origin[1] - (0.1 * gs.sensitivity),
-            ];
-        }
-        Some(VirtualKeyCode::Down) => {
-            gs.viewport.origin = [
-                gs.viewport.origin[0],
-                gs.viewport.origin[1] + (0.1 * gs.sensitivity),
-            ];
-        }
-        Some(VirtualKeyCode::Left) => {
-            gs.viewport.origin = [
-                gs.viewport.origin[0] - (0.1 * gs.sensitivity),
-                gs.viewport.origin[1],
-            ];
-        }
-        Some(VirtualKeyCode::Right) => {
-            gs.viewport.origin = [
-                gs.viewport.origin[0] + (0.1 * gs.sensitivity),
-                gs.viewport.origin[1],
-            ];
-        }
+        Some(VirtualKeyCode::Up) => gs.scene.objs[0].move_up(0.1 * gs.sensitivity),
+        Some(VirtualKeyCode::Down) => gs.scene.objs[0].move_down(0.1 * gs.sensitivity),
+        Some(VirtualKeyCode::Left) => gs.scene.objs[0].move_left(0.1 * gs.sensitivity),
+        Some(VirtualKeyCode::Right) => gs.scene.objs[0].move_right(0.1 * gs.sensitivity),
+        Some(VirtualKeyCode::Q) => gs.scene.objs[0].move_absolute(-1.0, -1.0),
+        Some(VirtualKeyCode::P) => gs.scene.objs[0].move_absolute(0.2, -1.0),
+        Some(VirtualKeyCode::C) => gs.scene.objs[0].move_absolute(0.0, 0.0),
+        Some(VirtualKeyCode::Z) => gs.scene.objs[0].move_absolute(-1.0, 0.2),
+        Some(VirtualKeyCode::M) => gs.scene.objs[0].move_absolute(0.2, 0.2),
+        Some(VirtualKeyCode::L) => gs.scene.objs[0].rotate_center(0.1),
+        Some(VirtualKeyCode::A) => gs.scene.objs[0].rotate_center(-0.1),
+        Some(VirtualKeyCode::D) => gs.scene.objs[0].scaling(0.9),
+        Some(VirtualKeyCode::F) => gs.scene.objs[0].scaling(1.1),
         Some(_) => {}
         None => {}
     }
@@ -438,39 +488,6 @@ fn main() {
 
     let (mut swapchain, images) = create_swapchain(&pdevice, &surface, &device);
 
-    let vertices = [
-        Vertex {
-            position: [-0.5, -0.25],
-        },
-        Vertex {
-            position: [0.0, 0.5],
-        },
-        Vertex {
-            position: [0.25, -0.1],
-        },
-        Vertex {
-            position: [0.9, 0.9],
-        },
-        Vertex {
-            position: [0.9, 0.8],
-        },
-        Vertex {
-            position: [0.8, 0.8],
-        },
-        Vertex {
-            position: [-0.9, 0.9],
-        },
-        Vertex {
-            position: [-0.7, 0.6],
-        },
-        Vertex {
-            position: [-0.5, 0.9],
-        },
-    ];
-    let vertex_buffer =
-        CpuAccessibleBuffer::from_iter(device.clone(), BufferUsage::all(), false, vertices)
-            .unwrap();
-
     let render_pass = vulkano::single_pass_renderpass!(
         device.clone(),
         attachments: {
@@ -488,11 +505,47 @@ fn main() {
     )
     .unwrap();
 
-    let pipeline = create_pipeline(&device, &render_pass);
+    let mut render_scene = RenderScene { objs: Vec::new() };
+
+    let render_obj1 = RenderObject::new(
+        "render1".to_string(),
+        create_pipeline(&device, &render_pass),
+        vec![
+            VulkanVertex2D {
+                position: [-0.5, -0.25],
+            },
+            VulkanVertex2D {
+                position: [0.0, 0.5],
+            },
+            VulkanVertex2D {
+                position: [0.25, -0.1],
+            },
+        ],
+    );
+
+    let render_obj2 = RenderObject::new(
+        "render2".to_string(),
+        create_pipeline(&device, &render_pass),
+        vec![
+            VulkanVertex2D {
+                position: [-0.9, 0.9],
+            },
+            VulkanVertex2D {
+                position: [-0.7, 0.6],
+            },
+            VulkanVertex2D {
+                position: [-0.5, 0.9],
+            },
+        ],
+    );
+
+    render_scene.objs.push(render_obj1);
+    render_scene.objs.push(render_obj2);
 
     let mut gs = GameStatus {
         viewport: create_viewport(),
         sensitivity: 1.5,
+        scene: render_scene,
     };
 
     let mut b_swapchain = false;
@@ -557,19 +610,47 @@ fn main() {
                     b_swapchain = true;
                 }
 
-                let command_buffer = draw(
-                    &device,
-                    &gs.viewport,
-                    &pipeline,
-                    &queue,
-                    &framebuffers[image_num],
-                    &vertex_buffer,
-                );
+                let mut builder = AutoCommandBufferBuilder::primary(
+                    device.clone(),
+                    queue.family(),
+                    CommandBufferUsage::OneTimeSubmit,
+                )
+                .unwrap();
+
+                builder
+                    .begin_render_pass(
+                        RenderPassBeginInfo {
+                            clear_values: vec![Some([0.0, 0.0, 1.0, 1.0].into())],
+                            ..RenderPassBeginInfo::framebuffer(framebuffers[image_num].clone())
+                        },
+                        SubpassContents::Inline,
+                    )
+                    .unwrap();
+
+                for render_obj in &gs.scene.objs {
+                    let buffer = CpuAccessibleBuffer::from_iter(
+                        device.clone(),
+                        BufferUsage::all(),
+                        false,
+                        render_obj.vertex.clone(),
+                    )
+                    .unwrap();
+                    builder
+                        .set_viewport(0, [gs.viewport.clone()])
+                        .bind_pipeline_graphics(render_obj.pipeline.clone())
+                        .bind_vertex_buffers(0, buffer.clone())
+                        .draw(buffer.len() as u32, 1, 0, 0)
+                        .unwrap();
+                }
+
+                builder.end_render_pass().unwrap();
+
+                let command_buffer = builder.build().unwrap();
 
                 let future = previous_frame_end
                     .take()
                     .unwrap()
-                    .join(acquire_future)
+                    //.join(acquire_future)
                     .then_execute(queue.clone(), command_buffer)
                     .unwrap()
                     .then_swapchain_present(queue.clone(), swapchain.clone(), image_num)
