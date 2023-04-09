@@ -176,7 +176,7 @@ impl Vertex2D {
     }
 
     pub fn scale(&mut self, x: f32) {
-        self.scale(x);
+        self.position.scale(x);
     }
 
     pub fn get_color(&self) -> ColorRGBA {
