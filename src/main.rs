@@ -1,50 +1,26 @@
 use core::panic;
-use std::collections::HashMap;
-use std::f32::consts::SQRT_2;
-use std::primitive;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use vulkano::buffer::TypedBufferAccess;
-use vulkano::command_buffer::{PrimaryAutoCommandBuffer, RenderPassBeginInfo, SubpassContents};
+use vulkano::command_buffer::{RenderPassBeginInfo, SubpassContents};
 use vulkano::device::Queue;
-use vulkano::image::swapchain;
-use vulkano::pipeline::compute;
-use vulkano::pipeline::graphics::input_assembly::PrimitiveTopology;
-use vulkano::pipeline::graphics::rasterization::{PolygonMode, RasterizationState};
-use vulkano::pipeline::graphics::GraphicsPipelineBuilder;
-use vulkano::render_pass::{Framebuffer, FramebufferCreateInfo, RenderPass, Subpass};
+use vulkano::render_pass::{Framebuffer, FramebufferCreateInfo, RenderPass};
 use vulkano::{
     buffer::{BufferUsage, CpuAccessibleBuffer},
-    command_buffer::{
-        AutoCommandBufferBuilder, CommandBufferUsage, RenderingAttachmentInfo, RenderingInfo,
-    },
+    command_buffer::{AutoCommandBufferBuilder, CommandBufferUsage},
     device::{
         physical::{PhysicalDevice, PhysicalDeviceType},
         Device, DeviceCreateInfo, DeviceExtensions, Features, QueueCreateInfo,
     },
     image::{view::ImageView, ImageAccess, ImageUsage, SwapchainImage},
     instance::{Instance, InstanceCreateInfo},
-    pipeline::{
-        graphics::{
-            input_assembly::InputAssemblyState,
-            render_pass::PipelineRenderingCreateInfo,
-            tessellation::TessellationState,
-            vertex_input::BuffersDefinition,
-            viewport::{Viewport, ViewportState},
-        },
-        GraphicsPipeline,
-    },
-    render_pass::{LoadOp, StoreOp},
-    swapchain::{
-        acquire_next_image, AcquireError, Surface, Swapchain, SwapchainCreateInfo,
-        SwapchainCreationError,
-    },
+    pipeline::graphics::viewport::Viewport,
+    swapchain::{acquire_next_image, AcquireError, Surface, Swapchain, SwapchainCreateInfo},
     sync::{self, FlushError, GpuFuture},
     Version,
 };
 use vulkano_win::VkSurfaceBuild;
-use winit::event::{ElementState, KeyboardInput, VirtualKeyCode};
-use winit::event_loop;
+use winit::event::{ElementState, KeyboardInput};
 use winit::{
     event::{Event, WindowEvent},
     event_loop::{ControlFlow, EventLoop},
@@ -55,7 +31,7 @@ mod render;
 mod types;
 
 use render::{Mesh, RenderScene};
-use types::{ColorRGBA, Point2D, Vertex2D, VulkanVertex2D};
+use types::{ColorRGBA, Point2D};
 
 struct GameStatus {
     pub viewport: Viewport,
