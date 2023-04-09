@@ -1,5 +1,9 @@
 use bytemuck::{Pod, Zeroable};
+use core::panic;
+use std::collections::HashMap;
 use std::f32::consts::SQRT_2;
+use std::primitive;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use vulkano::buffer::TypedBufferAccess;
 use vulkano::command_buffer::{PrimaryAutoCommandBuffer, RenderPassBeginInfo, SubpassContents};
@@ -55,27 +59,103 @@ struct GameStatus {
     pub scene: RenderScene,
 }
 
+enum RenderObjectShape {
+    POINT,
+    LINE,
+    TRIANGLE,
+    RECTANGLE,
+    SQUARE,
+}
+
 struct RenderObject {
-    id: String,
-    pipeline: Arc<GraphicsPipeline>,
+    id: usize,
+    shape: RenderObjectShape,
     vertex: Vec<VulkanVertex2D>,
+    is_fill: bool,
+    pipeline: Option<Arc<GraphicsPipeline>>,
+    primitive: PrimitiveTopology,
+    polygon_mode: PolygonMode,
 }
 
 impl RenderObject {
-    pub fn new(id: String, pipeline: Arc<GraphicsPipeline>, vertex: Vec<VulkanVertex2D>) -> Self {
-        let (c_x, c_y) = Self::compute_center(&vertex);
-        return Self {
+    pub fn new(vertex: Vec<VulkanVertex2D>, shape: RenderObjectShape, is_fill: bool) -> Self {
+        static ID_COUNTER: AtomicUsize = AtomicUsize::new(1);
+        let id = ID_COUNTER.fetch_add(1, Ordering::Acquire);
+        println!("Added RenderObject id:{}", id);
+        let mut obj = Self {
             id: id,
-            pipeline: pipeline,
+            shape: shape,
             vertex: vertex,
+            is_fill: is_fill,
+            pipeline: None,
+            primitive: PrimitiveTopology::PointList,
+            polygon_mode: PolygonMode::Line,
         };
+
+        obj
+    }
+
+    fn reload_render_property(&mut self) {
+        self.polygon_mode = match self.is_fill {
+            true => PolygonMode::Fill,
+            false => PolygonMode::Line,
+        };
+
+        self.primitive = match self.shape {
+            RenderObjectShape::RECTANGLE => match self.is_fill {
+                true => PrimitiveTopology::TriangleStrip,
+                false => PrimitiveTopology::LineStrip,
+            },
+            RenderObjectShape::LINE => PrimitiveTopology::LineList,
+            RenderObjectShape::POINT => PrimitiveTopology::PointList,
+            RenderObjectShape::TRIANGLE => PrimitiveTopology::TriangleList,
+            _ => {
+                println!("Render got unknown shape!");
+                PrimitiveTopology::PointList
+            }
+        }
+    }
+
+    pub fn build_pipeline(&mut self, device: &Arc<Device>, render_pass: &Arc<RenderPass>) {
+        self.reload_render_property();
+        let vs = vs::load(device.clone()).unwrap();
+        let fs = fs::load(device.clone()).unwrap();
+        //let tcs = tcs::load(device.clone()).unwrap();
+        //let tes = tes::load(device.clone()).unwrap();
+
+        /*.tessellation_shaders(
+            tcs.entry_point("main").unwrap(),
+            (),
+            tes.entry_point("main").unwrap(),
+            (),
+        )*/
+
+        let builder = GraphicsPipeline::start()
+            .vertex_input_state(BuffersDefinition::new().vertex::<VulkanVertex2D>())
+            .input_assembly_state(InputAssemblyState::new().topology(self.primitive))
+            .rasterization_state(RasterizationState::new().polygon_mode(self.polygon_mode))
+            /*.tessellation_state(
+                TessellationState::new()
+                    // Use a patch_control_points of 3, because we want to convert one triangle into
+                    // lots of little ones. A value of 4 would convert a rectangle into lots of little
+                    // triangles.
+                    .patch_control_points(3),
+            )*/
+            .vertex_shader(vs.entry_point("main").unwrap(), ())
+            // Use a resizable viewport set to draw over the entire window
+            .viewport_state(ViewportState::viewport_dynamic_scissor_irrelevant())
+            // See `vertex_shader`.
+            .fragment_shader(fs.entry_point("main").unwrap(), ())
+            // Now that our builder is filled, we call `build()` to obtain an actual pipeline.
+            .render_pass(Subpass::from(render_pass.clone(), 0).unwrap());
+        self.pipeline = Some(builder.build(device.clone()).unwrap());
     }
 
     fn compute_center(vertex: &Vec<VulkanVertex2D>) -> (f32, f32) {
         let mut proj_sum_x = 0.0;
         let mut proj_sum_y = 0.0;
         let num_vertex: f32 = vertex.len() as f32;
-        if (num_vertex == 0.0) {
+        if num_vertex == 0.0 {
             return (0.0, 0.0);
         }
 
@@ -140,18 +220,161 @@ impl RenderObject {
             v.position[1] = v.position[1] * x;
         }
     }
+
+    pub fn set_color(&mut self, color: Color) {
+        for v in &mut self.vertex {
+            v.color[0] = color.r;
+            v.color[1] = color.g;
+            v.color[2] = color.b;
+            v.color[3] = color.a;
+        }
+    }
+
+    pub fn get_fill(&self) -> bool {
+        self.is_fill
+    }
+
+    pub fn set_fill(&mut self, is_fill: bool) {
+        self.is_fill = is_fill;
+    }
+}
+
+struct Point2D {
+    x: f32,
+    y: f32,
+}
+
+impl Point2D {
+    pub fn new(x: f32, y: f32) -> Self {
+        Self { x: x, y: y }
+    }
+}
+
+struct Color {
+    r: f32,
+    g: f32,
+    b: f32,
+    a: f32,
+}
+
+impl Color {
+    pub fn new(r: f32, g: f32, b: f32, a: f32) -> Self {
+        Self {
+            r: r,
+            g: g,
+            b: b,
+            a: a,
+        }
+    }
 }
 
 struct RenderScene {
-    pub objs: Vec<RenderObject>,
+    objs: HashMap<usize, RenderObject>,
+}
+
+impl RenderScene {
+    pub fn get_objs(&self) -> &HashMap<usize, RenderObject> {
+        return &self.objs;
+    }
+
+    pub fn get_objs_mut(&mut self) -> &mut HashMap<usize, RenderObject> {
+        return &mut self.objs;
+    }
+
+    pub fn get(&self, k: usize) -> Option<&RenderObject> {
+        self.objs.get(&k)
+    }
+
+    pub fn get_mut(&mut self, k: usize) -> Option<&mut RenderObject> {
+        self.objs.get_mut(&k)
+    }
+
+    pub fn add_triangle(
+        &mut self,
+        p1: Point2D,
+        p2: Point2D,
+        p3: Point2D,
+        color: Color,
+        is_fill: bool,
+    ) -> usize {
+        let obj = RenderObject::new(
+            vec![
+                VulkanVertex2D {
+                    position: [p1.x, p1.y],
+                    color: [color.r, color.g, color.b, color.a],
+                },
+                VulkanVertex2D {
+                    position: [p2.x, p2.y],
+                    color: [color.r, color.g, color.b, color.a],
+                },
+                VulkanVertex2D {
+                    position: [p3.x, p3.y],
+                    color: [color.r, color.g, color.b, color.a],
+                },
+            ],
+            RenderObjectShape::TRIANGLE,
+            is_fill,
+        );
+        let id = obj.id;
+
+        self.objs.insert(id, obj);
+
+        id
+    }
+
+    pub fn add_rectangle(
+        &mut self,
+        topdown: Point2D,
+        h: f32,
+        w: f32,
+        color: Color,
+        is_fill: bool,
+    ) -> usize {
+        let obj = RenderObject::new(
+            vec![
+                VulkanVertex2D {
+                    position: [topdown.x, topdown.y],
+                    color: [color.r, color.g, color.b, color.a],
+                },
+                VulkanVertex2D {
+                    position: [topdown.x + w, topdown.y],
+                    color: [color.r, color.g, color.b, color.a],
+                },
+                VulkanVertex2D {
+                    position: [topdown.x + w, topdown.y + h],
+                    color: [color.r, color.g, color.b, color.a],
+                },
+                VulkanVertex2D {
+                    position: [topdown.x, topdown.y + h],
+                    color: [color.r, color.g, color.b, color.a],
+                },
+                VulkanVertex2D {
+                    position: [topdown.x, topdown.y],
+                    color: [color.r, color.g, color.b, color.a],
+                },
+            ],
+            RenderObjectShape::RECTANGLE,
+            is_fill,
+        );
+
+        let id = obj.id;
+        self.objs.insert(id, obj);
+
+        id
+    }
+
+    pub fn add_square(&mut self, topdown: Point2D, l: f32, color: Color, fill: bool) -> usize {
+        self.add_rectangle(topdown, l, l, color, fill)
+    }
 }
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Zeroable, Pod)]
 struct VulkanVertex2D {
     position: [f32; 2],
+    color: [f32; 4],
 }
-impl_vertex!(VulkanVertex2D, position);
+impl_vertex!(VulkanVertex2D, position, color);
 
 mod tcs {
     vulkano_shaders::shader! {
@@ -181,6 +404,7 @@ mod tes {
         ty: "tess_eval",
         src: "
         #version 450
+
         layout(triangles, equal_spacing, cw) in;
         void main(void)
         {
@@ -203,9 +427,14 @@ mod fs {
     vulkano_shaders::shader! {
         ty: "fragment",
         src: "#version 450
+
+
+        layout(location = 0) in vec4 color;
+
         layout(location = 0) out vec4 f_color;
+        
         void main() {
-            f_color = vec4(1.0, 1.0, 1.0, 1.0);
+            f_color = color;
         }"
     }
 }
@@ -214,12 +443,19 @@ mod vs {
     vulkano_shaders::shader! {
         ty: "vertex",
         src: "
-                    #version 450
-                    layout(location = 0) in vec2 position;
-                    void main() {
-                        gl_Position = vec4(position, 0.0, 1.0);
-                    }
-                "
+                #version 450
+
+                layout(location = 0) in vec2 position;
+                layout(location = 1) in vec4 color;
+
+                layout(location = 0) out vec4 f_color;
+                
+
+                void main() {
+                    gl_Position = vec4(position, 0.0, 1.0);
+                    f_color = color;
+                }
+            "
     }
 }
 
@@ -348,47 +584,6 @@ fn create_swapchain(
     .unwrap();
 }
 
-fn create_pipeline(device: &Arc<Device>, render_pass: &Arc<RenderPass>) -> Arc<GraphicsPipeline> {
-    let vs = vs::load(device.clone()).unwrap();
-    let fs = fs::load(device.clone()).unwrap();
-    let tcs = tcs::load(device.clone()).unwrap();
-    let tes = tes::load(device.clone()).unwrap();
-
-    return GraphicsPipeline::start()
-        // We need to indicate the layout of the vertices.
-        .vertex_input_state(BuffersDefinition::new().vertex::<VulkanVertex2D>())
-        .tessellation_shaders(
-            tcs.entry_point("main").unwrap(),
-            (),
-            tes.entry_point("main").unwrap(),
-            (),
-        )
-        // The content of the vertex buffer describes a list of triangles.
-        .input_assembly_state(
-            /*InputAssemblyState::new()*/
-            InputAssemblyState::new().topology(PrimitiveTopology::PatchList),
-        )
-        .rasterization_state(RasterizationState::new().polygon_mode(PolygonMode::Line))
-        .tessellation_state(
-            TessellationState::new()
-                // Use a patch_control_points of 3, because we want to convert one triangle into
-                // lots of little ones. A value of 4 would convert a rectangle into lots of little
-                // triangles.
-                .patch_control_points(3),
-        )
-        // A Vulkan shader can in theory contain multiple entry points, so we have to specify
-        // which one.
-        .vertex_shader(vs.entry_point("main").unwrap(), ())
-        // Use a resizable viewport set to draw over the entire window
-        .viewport_state(ViewportState::viewport_dynamic_scissor_irrelevant())
-        // See `vertex_shader`.
-        .fragment_shader(fs.entry_point("main").unwrap(), ())
-        // Now that our builder is filled, we call `build()` to obtain an actual pipeline.
-        .render_pass(Subpass::from(render_pass.clone(), 0).unwrap())
-        .build(device.clone())
-        .unwrap();
-}
-
 fn create_viewport() -> Viewport {
     return Viewport {
         origin: [0.0, 0.0],
@@ -408,7 +603,7 @@ fn recreate_swapchain(
         Ok(r) => r,
         // This error tends to happen when the user is manually resizing the window.
         // Simply restarting the loop is the easiest way to fix this issue.
-        //Err(SwapchainCreationError::ImageExtentNotSupported { .. }) => return,
+        //Err(SwapchainCreationError::ImageExtentNotSupported { .. }) => return, //TODO: Add it again?
         Err(e) => panic!("Failed to recreate swapchain: {:?}", e),
     };
     return (new_swapchain, new_images);
@@ -443,20 +638,54 @@ fn keypressed(input: &KeyboardInput, gs: &mut GameStatus) {
         return;
     }
 
+    static CURRENT_ID: AtomicUsize = AtomicUsize::new(1);
+    let obj_id = CURRENT_ID.load(Ordering::Acquire);
+
+    let current_obj = match gs.scene.get_mut(obj_id) {
+        Some(obj) => obj,
+        None => {
+            println!("obj_id {} is not found!", obj_id);
+            return;
+        }
+    };
+
     match input.virtual_keycode {
-        Some(VirtualKeyCode::Up) => gs.scene.objs[0].move_up(0.1 * gs.sensitivity),
-        Some(VirtualKeyCode::Down) => gs.scene.objs[0].move_down(0.1 * gs.sensitivity),
-        Some(VirtualKeyCode::Left) => gs.scene.objs[0].move_left(0.1 * gs.sensitivity),
-        Some(VirtualKeyCode::Right) => gs.scene.objs[0].move_right(0.1 * gs.sensitivity),
-        Some(VirtualKeyCode::Q) => gs.scene.objs[0].move_absolute(-1.0, -1.0),
-        Some(VirtualKeyCode::P) => gs.scene.objs[0].move_absolute(0.2, -1.0),
-        Some(VirtualKeyCode::C) => gs.scene.objs[0].move_absolute(0.0, 0.0),
-        Some(VirtualKeyCode::Z) => gs.scene.objs[0].move_absolute(-1.0, 0.2),
-        Some(VirtualKeyCode::M) => gs.scene.objs[0].move_absolute(0.2, 0.2),
-        Some(VirtualKeyCode::L) => gs.scene.objs[0].rotate_center(0.1),
-        Some(VirtualKeyCode::A) => gs.scene.objs[0].rotate_center(-0.1),
-        Some(VirtualKeyCode::D) => gs.scene.objs[0].scaling(0.9),
-        Some(VirtualKeyCode::F) => gs.scene.objs[0].scaling(1.1),
+        Some(VirtualKeyCode::Up) => current_obj.move_up(0.1 * gs.sensitivity),
+        Some(VirtualKeyCode::Down) => current_obj.move_down(0.1 * gs.sensitivity),
+        Some(VirtualKeyCode::Left) => current_obj.move_left(0.1 * gs.sensitivity),
+        Some(VirtualKeyCode::Right) => current_obj.move_right(0.1 * gs.sensitivity),
+        Some(VirtualKeyCode::Q) => current_obj.move_absolute(-1.0, -1.0),
+        Some(VirtualKeyCode::P) => current_obj.move_absolute(0.2, -1.0),
+        Some(VirtualKeyCode::C) => current_obj.move_absolute(0.0, 0.0),
+        Some(VirtualKeyCode::Z) => current_obj.move_absolute(-1.0, 0.2),
+        Some(VirtualKeyCode::M) => current_obj.move_absolute(0.2, 0.2),
+        Some(VirtualKeyCode::L) => current_obj.rotate_center(0.1),
+        Some(VirtualKeyCode::A) => current_obj.rotate_center(-0.1),
+        Some(VirtualKeyCode::D) => current_obj.scaling(0.9),
+        Some(VirtualKeyCode::E) => current_obj.scaling(1.1),
+        Some(VirtualKeyCode::K) => {
+            let mut found_id = false;
+            // TODO: add get_keys instead
+            for (key, obj) in gs.scene.get_objs() {
+                if found_id {
+                    CURRENT_ID.store(*key, Ordering::Relaxed);
+                    found_id = false;
+                }
+                if obj_id == *key {
+                    found_id = true;
+                }
+            }
+            if found_id {
+                CURRENT_ID.store(
+                    *gs.scene.get_objs().iter().next().unwrap().0,
+                    Ordering::Relaxed,
+                );
+            }
+        }
+        Some(VirtualKeyCode::R) => current_obj.set_color(Color::new(1.0, 0.0, 0.0, 1.0)),
+        Some(VirtualKeyCode::G) => current_obj.set_color(Color::new(0.0, 1.0, 0.0, 1.0)),
+        Some(VirtualKeyCode::B) => current_obj.set_color(Color::new(0.0, 0.0, 1.0, 1.0)),
+        Some(VirtualKeyCode::F) => current_obj.set_fill(!current_obj.get_fill()),
         Some(_) => {}
         None => {}
     }
@@ -505,48 +734,50 @@ fn main() {
     )
     .unwrap();
 
-    let mut render_scene = RenderScene { objs: Vec::new() };
+    let mut render_scene = RenderScene {
+        objs: HashMap::new(),
+    };
 
-    let render_obj1 = RenderObject::new(
-        "render1".to_string(),
-        create_pipeline(&device, &render_pass),
-        vec![
-            VulkanVertex2D {
-                position: [-0.5, -0.25],
-            },
-            VulkanVertex2D {
-                position: [0.0, 0.5],
-            },
-            VulkanVertex2D {
-                position: [0.25, -0.1],
-            },
-        ],
+    render_scene.add_triangle(
+        Point2D::new(-0.5, -0.25),
+        Point2D::new(0.0, 0.5),
+        Point2D::new(0.25, -0.1),
+        Color::new(1.0, 1.0, 1.0, 1.0),
+        true,
     );
 
-    let render_obj2 = RenderObject::new(
-        "render2".to_string(),
-        create_pipeline(&device, &render_pass),
-        vec![
-            VulkanVertex2D {
-                position: [-0.9, 0.9],
-            },
-            VulkanVertex2D {
-                position: [-0.7, 0.6],
-            },
-            VulkanVertex2D {
-                position: [-0.5, 0.9],
-            },
-        ],
+    render_scene.add_triangle(
+        Point2D::new(-0.9, 0.9),
+        Point2D::new(-0.7, 0.6),
+        Point2D::new(-0.5, 0.9),
+        Color::new(0.0, 0.0, 1.0, 1.0),
+        false,
     );
 
-    render_scene.objs.push(render_obj1);
-    render_scene.objs.push(render_obj2);
+    render_scene.add_rectangle(
+        Point2D::new(-0.3, 0.4),
+        0.3,
+        0.7,
+        Color::new(0.0, 1.0, 0.0, 1.0),
+        false,
+    );
+
+    render_scene.add_square(
+        Point2D::new(0.3, -0.4),
+        0.3,
+        Color::new(0.0, 1.0, 0.0, 1.0),
+        true,
+    );
 
     let mut gs = GameStatus {
         viewport: create_viewport(),
         sensitivity: 1.5,
         scene: render_scene,
     };
+
+    for (id, obj) in gs.scene.get_objs_mut() {
+        obj.build_pipeline(&device, &render_pass);
+    }
 
     let mut b_swapchain = false;
 
@@ -620,24 +851,28 @@ fn main() {
                 builder
                     .begin_render_pass(
                         RenderPassBeginInfo {
-                            clear_values: vec![Some([0.0, 0.0, 1.0, 1.0].into())],
+                            clear_values: vec![Some([0.0, 0.0, 0.0, 1.0].into())],
                             ..RenderPassBeginInfo::framebuffer(framebuffers[image_num].clone())
                         },
                         SubpassContents::Inline,
                     )
                     .unwrap();
 
-                for render_obj in &gs.scene.objs {
+                for (id, obj) in gs.scene.get_objs() {
+                    let pipeline = match &obj.pipeline {
+                        Some(pipeline) => pipeline.clone(),
+                        None => panic!("Trying to draw without pipeline!"),
+                    };
                     let buffer = CpuAccessibleBuffer::from_iter(
                         device.clone(),
                         BufferUsage::all(),
                         false,
-                        render_obj.vertex.clone(),
+                        obj.vertex.clone(),
                     )
                     .unwrap();
                     builder
                         .set_viewport(0, [gs.viewport.clone()])
-                        .bind_pipeline_graphics(render_obj.pipeline.clone())
+                        .bind_pipeline_graphics(pipeline)
                         .bind_vertex_buffers(0, buffer.clone())
                         .draw(buffer.len() as u32, 1, 0, 0)
                         .unwrap();
@@ -650,7 +885,7 @@ fn main() {
                 let future = previous_frame_end
                     .take()
                     .unwrap()
-                    //.join(acquire_future)
+                    .join(acquire_future)
                     .then_execute(queue.clone(), command_buffer)
                     .unwrap()
                     .then_swapchain_present(queue.clone(), swapchain.clone(), image_num)
